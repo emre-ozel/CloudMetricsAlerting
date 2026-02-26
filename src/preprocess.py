@@ -15,6 +15,7 @@ Key design choices:
 
 import argparse
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -66,7 +67,7 @@ def extract_window_features(values: np.ndarray, W: int) -> np.ndarray:
 
 def process_segment(
     seg_df: pd.DataFrame, W: int, H: int
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Process one segment → (X, y), respecting boundaries.
     Values are z-score normalised per-segment before feature extraction."""
     values = seg_df["metric_value"].values.astype(np.float64)
