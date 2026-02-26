@@ -19,7 +19,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import joblib
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 METRICS_PATH = DATA_DIR / "metrics.parquet"
