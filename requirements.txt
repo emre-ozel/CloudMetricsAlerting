@@ -2,6 +2,7 @@ numpy
 pandas
 scikit-learn
 lightgbm
+xgboost
 matplotlib
 pyarrow
 optuna
