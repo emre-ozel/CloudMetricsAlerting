@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  CloudMetricsAlerting — Two-Lambda predictive alerting pipeline.
+  RetrainFunction runs daily to retrain XGBoost + LightGBM models and
+  upload artifacts to S3.  InferenceFunction runs every minute, scores
+  live CloudWatch metrics, and triggers SNS alerts when risk is high.
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+    Description: Deployment environment tag.
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive incident alerts via SNS.
+
+  MetricsConfig:
+    Type: String
+    Default: "[]"
+    Description: >
+      JSON array of metric descriptors.  Each item must have:
+        namespace, metric, dim_name, dim_value.
+      Example: [{"namespace":"AWS/EC2","metric":"CPUUtilization",
+                  "dim_name":"InstanceId","dim_value":"i-0abc123"}]
+
+  LookbackDays:
+    Type: Number
+    Default: 90
+    Description: Days of CloudWatch history to use for retraining.
+
+  AlertModel:
+    Type: String
+    Default: ensemble
+    AllowedValues: [lgbm, xgb, ensemble]
+    Description: Which model(s) to use for live scoring.
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]          # Graviton2 — cheaper & faster for ML
+    MemorySize: 1024                # MB; models need ~400 MB loaded
+    Timeout: 300                    # seconds (retrain may take a few minutes)
+    Environment:
+      Variables:
+        ARTIFACT_BUCKET: !Ref ArtifactBucket
+        ARTIFACT_PREFIX: !Sub "alerting/models/${Environment}/"
+        METRICS_CONFIG:  !Ref MetricsConfig
+        ALERT_MODEL:     !Ref AlertModel
+        AWS_ACCOUNT_ID:  !Ref AWS::AccountId
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 Bucket for model artifacts ─────────────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cloud-metrics-alerting-artifacts-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Keep only the last 30 daily model versions
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Retain
+
+  # ── SNS Topic for incident alerts ─────────────────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cloud-metrics-alerts-${Environment}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── IAM Role shared between both Lambdas ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CloudMetricsAlertingRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArtifactBucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:HeadObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:PutMetricData   # emit custom RiskScore metric
+                Resource: "*"
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  # ── Retraining Lambda (daily at 02:00 UTC) ────────────────────────────────
+  RetrainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cloud-metrics-retrain-${Environment}"
+      Description: "Daily retraining of XGBoost + LightGBM incident-prediction models."
+      CodeUri: retrain/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 2048      # Training needs more RAM
+      Timeout: 900          # 15 minutes max
+      Environment:
+        Variables:
+          LOOKBACK_DAYS: !Ref LookbackDays
+      Events:
+        DailyRetrain:
+          Type: Schedule
+          Properties:
+            Name: !Sub "cloud-metrics-retrain-schedule-${Environment}"
+            Description: "Trigger model retraining every day at 02:00 UTC."
+            Schedule: cron(0 2 * * ? *)
+            Enabled: true
+            Input: '{"trigger": "scheduled"}'
+      Layers:
+        - !Ref SharedDepsLayer
+
+  # ── Inference Lambda (every minute) ──────────────────────────────────────
+  InferenceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cloud-metrics-inference-${Environment}"
+      Description: "Per-minute incident-risk scoring and SNS alerting."
+      CodeUri: inference/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 512       # Inference is much lighter than training
+      Timeout: 55           # Must finish before next 60-second invocation
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Name: !Sub "cloud-metrics-inference-schedule-${Environment}"
+            Description: "Run inference and alert check every minute."
+            Schedule: rate(1 minute)
+            Enabled: true
+            Input: '{"trigger": "scheduled"}'
+      Layers:
+        - !Ref SharedDepsLayer
+
+  # ── Lambda Layer: shared Python deps + shared/ utilities ─────────────────
+  SharedDepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "cloud-metrics-shared-${Environment}"
+      Description: "numpy, scikit-learn, lightgbm, xgboost, joblib + shared/ code."
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Delete
+
+  # ── CloudWatch Log Groups (explicit so retention is set) ─────────────────
+  RetrainLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cloud-metrics-retrain-${Environment}"
+      RetentionInDays: 30
+
+  InferenceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cloud-metrics-inference-${Environment}"
+      RetentionInDays: 7
+
+  # ── CloudWatch Alarm: alert if inference Lambda errors spike ─────────────
+  InferenceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "cloud-metrics-inference-errors-${Environment}"
+      AlarmDescription: "Inference Lambda is throwing errors — check logs."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref InferenceFunction
+      Period: 300           # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Statistic: Sum
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ── CloudWatch Alarm: alert if retrain Lambda fails ───────────────────────
+  RetrainErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "cloud-metrics-retrain-errors-${Environment}"
+      AlarmDescription: "Daily retraining Lambda failed — models may be stale."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RetrainFunction
+      Period: 86400         # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Statistic: Sum
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  ArtifactBucketName:
+    Description: S3 bucket storing model artifacts.
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucket"
+
+  AlertTopicArn:
+    Description: SNS topic ARN for incident alerts.
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertTopic"
+
+  RetrainFunctionArn:
+    Description: ARN of the daily retraining Lambda.
+    Value: !GetAtt RetrainFunction.Arn
+
+  InferenceFunctionArn:
+    Description: ARN of the per-minute inference Lambda.
+    Value: !GetAtt InferenceFunction.Arn
