@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
+    accuracy_score,
     precision_recall_curve,
     roc_auc_score,
     classification_report,
@@ -139,6 +140,9 @@ def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: floa
 
     print(f"\n── Step-level Classification Report ──")
     print(classification_report(y_test, y_pred, digits=3, zero_division=0))
+
+    test_acc = accuracy_score(y_test, y_pred)
+    print(f"  Test accuracy:   {test_acc:.4f}")
 
     try:
         auc = roc_auc_score(y_test, y_prob)

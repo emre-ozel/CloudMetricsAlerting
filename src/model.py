@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import lightgbm as lgb
 from xgboost import XGBClassifier
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score
 import joblib
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -116,9 +116,13 @@ def main():
         print("\n── LightGBM ──────────────────────────────────────")
         lgbm_model = train_lgbm(X_train, y_train, X_val, y_val)
         joblib.dump(lgbm_model, DATA_DIR / "model_lgbm.pkl")
+        train_acc = accuracy_score(y_train, lgbm_model.predict(X_train))
         val_prob = lgbm_model.predict_proba(X_val)[:, 1]
+        val_acc = accuracy_score(y_val, lgbm_model.predict(X_val))
         th, f1 = find_best_threshold(y_val, val_prob)
         thresholds["lgbm"] = th
+        print(f"  Train accuracy:  {train_acc:.4f}")
+        print(f"  Val accuracy:    {val_acc:.4f}")
         print(f"  Val prob range: [{val_prob.min():.3f}, {val_prob.max():.3f}]")
         print(f"  Best threshold: {th:.2f}  (val F1={f1:.3f})")
         print(f"  Saved model_lgbm.pkl")
@@ -127,9 +131,13 @@ def main():
         print("\n── XGBoost ────────────────────────────────────────")
         xgb_model = train_xgb(X_train, y_train, X_val, y_val)
         joblib.dump(xgb_model, DATA_DIR / "model_xgb.pkl")
+        train_acc = accuracy_score(y_train, xgb_model.predict(X_train))
         val_prob = xgb_model.predict_proba(X_val)[:, 1]
+        val_acc = accuracy_score(y_val, xgb_model.predict(X_val))
         th, f1 = find_best_threshold(y_val, val_prob)
         thresholds["xgb"] = th
+        print(f"  Train accuracy:  {train_acc:.4f}")
+        print(f"  Val accuracy:    {val_acc:.4f}")
         print(f"  Val prob range: [{val_prob.min():.3f}, {val_prob.max():.3f}]")
         print(f"  Best threshold: {th:.2f}  (val F1={f1:.3f})")
         print(f"  Saved model_xgb.pkl")
