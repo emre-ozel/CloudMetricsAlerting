@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     precision_recall_curve,
     roc_auc_score,
     classification_report,
@@ -128,6 +129,22 @@ def plot_threshold_sweep(y_true, y_prob, label, save_path):
     plt.close()
 
 
+def compute_fpr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """False Positive Rate = FP / (FP + TN)."""
+    fp = int(np.sum((y_pred == 1) & (y_true == 0)))
+    tn = int(np.sum((y_pred == 0) & (y_true == 0)))
+    return fp / max(fp + tn, 1)
+
+
+def compute_false_alarm_rate_per_hour(
+    y_true: np.ndarray, y_pred: np.ndarray, step_minutes: float = 5.0
+) -> float:
+    """False alarms per hour = FP / total_hours."""
+    fp = int(np.sum((y_pred == 1) & (y_true == 0)))
+    total_hours = len(y_true) * step_minutes / 60.0
+    return fp / max(total_hours, 1e-9)
+
+
 def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: float):
     """Full evaluation of a single model at the given threshold."""
     model = joblib.load(model_path)
@@ -150,6 +167,17 @@ def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: floa
         auc = float("nan")
     print(f"  ROC-AUC: {auc:.3f}")
 
+    # ── New metrics: FPR, false alarm rate, average precision ──
+    fpr = compute_fpr(y_test, y_pred)
+    fa_per_hour = compute_false_alarm_rate_per_hour(y_test, y_pred)
+    try:
+        ap = average_precision_score(y_test, y_prob)
+    except ValueError:
+        ap = float("nan")
+    print(f"  False Positive Rate (FPR): {fpr:.4f}")
+    print(f"  False Alarm Rate:  {fa_per_hour:.2f} / hour")
+    print(f"  Avg Precision (AP): {ap:.3f}")
+
     print(f"\n── Incident-level Metrics ──")
     inc = incident_level_metrics(y_test, y_pred)
     print(
@@ -166,7 +194,11 @@ def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: floa
     )
     print(f"  Saved plots to {PLOTS_DIR}/")
 
-    return {"label": label, "auc": auc, "threshold": threshold, **inc}
+    return {
+        "label": label, "auc": auc, "threshold": threshold,
+        "fpr": fpr, "fa_per_hour": fa_per_hour, "ap": ap,
+        **inc,
+    }
 
 
 def main():
@@ -199,13 +231,16 @@ def main():
         print(f"\n{'═' * 60}")
         print("  Summary")
         print(f"{'═' * 60}")
-        print(
-            f"  {'Model':<22} {'Thresh':>6} {'AUC':>6} {'Inc.Recall':>10} {'LeadTime':>10}"
+        header = (
+            f"  {'Model':<16} {'Thresh':>6} {'AUC':>6} {'Inc.Rec':>8} "
+            f"{'LeadT':>6} {'FPR':>7} {'FA/h':>7} {'AP':>6}"
         )
+        print(header)
         for r in results:
             print(
-                f"  {r['label']:<22} {r['threshold']:>6.2f} {r['auc']:>6.3f} "
-                f"{r['incident_recall']:>10.3f} {r['mean_lead_time']:>10.1f}"
+                f"  {r['label']:<16} {r['threshold']:>6.2f} {r['auc']:>6.3f} "
+                f"{r['incident_recall']:>8.3f} {r['mean_lead_time']:>6.1f} "
+                f"{r['fpr']:>7.4f} {r['fa_per_hour']:>7.2f} {r['ap']:>6.3f}"
             )
 
 
