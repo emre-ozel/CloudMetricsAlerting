@@ -11,7 +11,13 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import lightgbm as lgb
+try:
+    import lightgbm as lgb
+    _LGBM_AVAILABLE = True
+except (ImportError, OSError) as _lgbm_err:
+    lgb = None  # type: ignore[assignment]
+    _LGBM_AVAILABLE = False
+    _LGBM_IMPORT_ERROR = _lgbm_err
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, f1_score
 import joblib
@@ -34,6 +40,7 @@ def load_data():
 # ---------------------------------------------------------------------------
 # Incident helpers (duplicated from evaluate.py to keep model.py self-contained)
 # ---------------------------------------------------------------------------
+
 
 def _incident_intervals(y: np.ndarray) -> list[tuple[int, int]]:
     """Identify contiguous incident intervals. Returns (start, end) inclusive."""
@@ -71,6 +78,7 @@ def _incident_recall(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # Threshold selection
 # ---------------------------------------------------------------------------
 
+
 def find_best_threshold(y_true, y_prob):
     """Pick threshold that maximises F1 on the given set (legacy helper)."""
     best_th, best_f1 = 0.5, 0.0
@@ -105,8 +113,10 @@ def find_recall_threshold(y_true, y_prob, min_recall: float = 0.80):
     if best_th is None:
         # Recall target unachievable — fall back to F1-max
         best_th, _ = find_best_threshold(y_true, y_prob)
-        print(f"  ⚠ Recall target ({min_recall:.0%}) not achievable; "
-              f"falling back to F1-max threshold {best_th:.2f}")
+        print(
+            f"  ⚠ Recall target ({min_recall:.0%}) not achievable; "
+            f"falling back to F1-max threshold {best_th:.2f}"
+        )
 
     pred = (y_prob >= best_th).astype(int)
     rec = _incident_recall(y_true, pred)
@@ -116,6 +126,11 @@ def find_recall_threshold(y_true, y_prob, min_recall: float = 0.80):
 
 def train_lgbm(X_train, y_train, X_val, y_val):
     """Train a LightGBM classifier with class-imbalance handling."""
+    if not _LGBM_AVAILABLE:
+        raise RuntimeError(
+            f"LightGBM could not be imported: {_LGBM_IMPORT_ERROR}\n"
+            "On macOS, install the OpenMP runtime with: brew install libomp"
+        ) from _LGBM_IMPORT_ERROR
     n_pos = y_train.sum()
     n_neg = len(y_train) - n_pos
     scale = n_neg / max(n_pos, 1)
@@ -177,6 +192,7 @@ def train_xgb(X_train, y_train, X_val, y_val):
 # Optuna hyperparameter tuning
 # ---------------------------------------------------------------------------
 
+
 def tune_xgb_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
     """
     Search XGBoost hyper-parameters with Optuna.
@@ -215,8 +231,7 @@ def tune_xgb_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
         return rec
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize",
-                                study_name="xgb-incident-recall")
+    study = optuna.create_study(direction="maximize", study_name="xgb-incident-recall")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     print(f"\n  Optuna best incident recall: {study.best_value:.3f}")
@@ -241,11 +256,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["lgbm", "xgb", "both"], default="both")
     parser.add_argument(
-        "--tune", action="store_true",
+        "--tune",
+        action="store_true",
         help="Run Optuna hyperparameter tuning for XGBoost before training.",
     )
     parser.add_argument(
-        "--trials", type=int, default=50,
+        "--trials",
+        type=int,
+        default=50,
         help="Number of Optuna trials (default: 50).",
     )
     args = parser.parse_args()
@@ -258,6 +276,17 @@ def main():
 
     if args.model in ("lgbm", "both"):
         print("\n── LightGBM ──────────────────────────────────────")
+        if not _LGBM_AVAILABLE:
+            print(
+                f"  ⚠ LightGBM unavailable ({_LGBM_IMPORT_ERROR}).\n"
+                "  On macOS run: brew install libomp\n"
+                "  Skipping LightGBM training."
+            )
+            if args.model == "lgbm":
+                return
+            # fall through to XGBoost when model == "both"
+            args.model = "xgb"
+            print()
         lgbm_model = train_lgbm(X_train, y_train, X_val, y_val)
         joblib.dump(lgbm_model, DATA_DIR / "model_lgbm.pkl")
         train_acc = accuracy_score(y_train, lgbm_model.predict(X_train))

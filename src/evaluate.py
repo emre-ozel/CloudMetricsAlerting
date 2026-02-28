@@ -195,8 +195,12 @@ def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: floa
     print(f"  Saved plots to {PLOTS_DIR}/")
 
     return {
-        "label": label, "auc": auc, "threshold": threshold,
-        "fpr": fpr, "fa_per_hour": fa_per_hour, "ap": ap,
+        "label": label,
+        "auc": auc,
+        "threshold": threshold,
+        "fpr": fpr,
+        "fa_per_hour": fa_per_hour,
+        "ap": ap,
         **inc,
     }
 
