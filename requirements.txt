@@ -2,7 +2,7 @@ numpy
 pandas
 scikit-learn
 lightgbm
-xgboost
+imbalanced-learn
 matplotlib
 pyarrow
 optuna

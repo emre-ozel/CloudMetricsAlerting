@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 
 Description: >
   CloudMetricsAlerting — Two-Lambda predictive alerting pipeline.
-  RetrainFunction runs daily to retrain XGBoost + LightGBM models and
+  RetrainFunction runs daily to retrain Neural Network + LightGBM models and
   upload artifacts to S3.  InferenceFunction runs every minute, scores
   live CloudWatch metrics, and triggers SNS alerts when risk is high.
 
@@ -36,7 +36,7 @@ Parameters:
   AlertModel:
     Type: String
     Default: ensemble
-    AllowedValues: [lgbm, xgb, ensemble]
+    AllowedValues: [lgbm, nn, ensemble]
     Description: Which model(s) to use for live scoring.
 
 # ── Globals ───────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "cloud-metrics-retrain-${Environment}"
-      Description: "Daily retraining of XGBoost + LightGBM incident-prediction models."
+      Description: "Daily retraining of Neural Network + LightGBM incident-prediction models."
       CodeUri: retrain/
       Handler: handler.handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -189,7 +189,7 @@ Resources:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName: !Sub "cloud-metrics-shared-${Environment}"
-      Description: "numpy, scikit-learn, lightgbm, xgboost, joblib + shared/ code."
+      Description: "numpy, scikit-learn, lightgbm, joblib + shared/ code."
       ContentUri: layer/
       CompatibleRuntimes: [python3.12]
       RetentionPolicy: Delete

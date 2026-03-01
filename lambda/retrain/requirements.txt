@@ -1,6 +1,6 @@
 numpy
 scikit-learn
 lightgbm
-xgboost
+imbalanced-learn
 joblib
 boto3

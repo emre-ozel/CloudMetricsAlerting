@@ -13,7 +13,7 @@ EventBridge (daily)          EventBridge (every minute)
     metric history                (ETag-cached in /tmp)
  2. Preprocess features        2. Fetch last 90 min of
  3. Train LightGBM +              CloudWatch data
-    XGBoost                    3. Extract window features
+    Neural Network             3. Extract window features
  4. Tune thresholds            4. Ensemble predict_proba
  5. Upload artifacts  ──S3──▶  5. Emit custom CW metric
     to S3                      6. If risk ≥ threshold
@@ -94,7 +94,7 @@ A JSON array describing which CloudWatch metrics to monitor.
 | `ARTIFACT_PREFIX`| `alerting/models/prod/`    | S3 key prefix                            |
 | `LOOKBACK_DAYS`  | `90`                       | Days of history to use for retraining    |
 | `SNS_TOPIC_ARN`  | *(required, inference)*    | SNS topic to publish alerts to           |
-| `ALERT_MODEL`    | `ensemble`                 | `lgbm`, `xgb`, or `ensemble`            |
+| `ALERT_MODEL`    | `ensemble`                 | `lgbm`, `nn`, or `ensemble`            |
 
 ---
 
@@ -141,8 +141,8 @@ make logs-inference
    fetching up to `LOOKBACK_DAYS` days of 1-minute averages.
 2. Applies the same **sliding-window feature extraction** as `src/preprocess.py`
    (7 features: mean, std, min, max, last, slope, roc over a W=30 look-back).
-3. Splits data temporally (70/15/15) and trains both LightGBM and XGBoost with
-   `scale_pos_weight` to handle the ~10:1 class imbalance.
+3. Splits data temporally (70/15/15) and trains both LightGBM and Neural Network with
+   SMOTE/class-weighting to handle the ~10:1 class imbalance.
 4. Sweeps thresholds on the validation set and picks the one maximising F1.
 5. Uploads all artifacts to S3 as both **timestamped** and **`_latest`** keys:
    - `alerting/models/prod/model_lgbm_20260227T020000.pkl`
@@ -157,7 +157,7 @@ make logs-inference
    against CloudWatch data latency and missing points).
 3. Uses **online EMA normalisation** (`RunningStats`, α = 0.01) so the feature
    scale adapts to slow distribution drift without requiring a full retrain.
-4. Computes ensemble probability: `(p_lgbm + p_xgb) / 2`.
+4. Computes ensemble probability: `(p_lgbm + p_nn) / 2`.
 5. Emits a `AlertingPipeline/IncidentRisk/RiskScore` CloudWatch metric per
    resource — you can graph this and set independent CloudWatch Alarms on it.
 6. Publishes a structured JSON SNS message if `risk ≥ threshold`, with severity

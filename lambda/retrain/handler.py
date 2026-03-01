@@ -9,7 +9,7 @@ What it does
    monitored namespace/metric, one API call per metric.
 2. Runs the same preprocessing pipeline as src/preprocess.py (sliding-window
    feature extraction, temporal 70/15/15 split within each segment).
-3. Trains both a LightGBM and an XGBoost classifier with class-imbalance
+3. Trains both a LightGBM and a Neural Network classifier with class-imbalance
    handling and early stopping.
 4. Tunes alert thresholds on the validation set (maximise F1).
 5. Uploads model artifacts + thresholds to S3 so the inference Lambda can
@@ -234,18 +234,17 @@ def find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, 
 
 def train_lgbm(X_train, y_train, X_val, y_val):
     import lightgbm as lgb
+    from imblearn.over_sampling import SMOTE
 
-    n_pos = y_train.sum()
-    n_neg = len(y_train) - n_pos
-    scale = n_neg / max(n_pos, 1)
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
     model = lgb.LGBMClassifier(
         n_estimators=500,
-        max_depth=4,
-        num_leaves=15,
+        max_depth=6,
+        num_leaves=31,
         learning_rate=0.05,
-        scale_pos_weight=scale,
-        min_child_samples=50,
+        min_child_samples=20,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_alpha=0.1,
@@ -254,8 +253,8 @@ def train_lgbm(X_train, y_train, X_val, y_val):
         verbosity=-1,
     )
     model.fit(
-        X_train,
-        y_train,
+        X_res,
+        y_res,
         eval_set=[(X_val, y_val)],
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(50, verbose=False)],
@@ -263,28 +262,25 @@ def train_lgbm(X_train, y_train, X_val, y_val):
     return model
 
 
-def train_xgb(X_train, y_train, X_val, y_val):
-    from xgboost import XGBClassifier
+def train_nn(X_train, y_train, X_val, y_val):
+    from sklearn.neural_network import MLPClassifier
+    from imblearn.over_sampling import SMOTE
 
-    n_pos = y_train.sum()
-    n_neg = len(y_train) - n_pos
-    scale = n_neg / max(n_pos, 1)
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    model = XGBClassifier(
-        n_estimators=500,
-        max_depth=4,
-        learning_rate=0.05,
-        scale_pos_weight=scale,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+    model = MLPClassifier(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        solver="adam",
+        alpha=0.0001,
+        learning_rate_init=0.001,
+        max_iter=500,
         random_state=42,
-        eval_metric="logloss",
-        early_stopping_rounds=50,
-        verbosity=0,
+        early_stopping=True,
+        validation_fraction=0.1,
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model.fit(X_res, y_res)
     return model
 
 
@@ -358,7 +354,7 @@ def handler(event: dict, context: Any) -> dict:
     thresholds: dict[str, float] = {}
     model_keys: dict[str, str] = {}
 
-    for model_name, train_fn in [("lgbm", train_lgbm), ("xgb", train_xgb)]:
+    for model_name, train_fn in [("lgbm", train_lgbm), ("nn", train_nn)]:
         logger.info("Training %s …", model_name)
         model = train_fn(X_train, y_train, X_val, y_val)
         val_prob = model.predict_proba(X_val)[:, 1]

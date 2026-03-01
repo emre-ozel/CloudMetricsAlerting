@@ -207,7 +207,7 @@ def evaluate_model(model_path: Path, X_test, y_test, label: str, threshold: floa
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["lgbm", "xgb", "both"], default="both")
+    parser.add_argument("--model", choices=["lgbm", "nn", "both"], default="both")
     args = parser.parse_args()
 
     X_test, y_test = load_data()
@@ -225,11 +225,11 @@ def main():
             th = thresholds.get("lgbm", 0.5)
             results.append(evaluate_model(path, X_test, y_test, "LightGBM", th))
 
-    if args.model in ("xgb", "both"):
-        path = DATA_DIR / "model_xgb.pkl"
+    if args.model in ("nn", "both"):
+        path = DATA_DIR / "model_nn.pkl"
         if path.exists():
-            th = thresholds.get("xgb", 0.5)
-            results.append(evaluate_model(path, X_test, y_test, "XGBoost", th))
+            th = thresholds.get("nn", 0.5)
+            results.append(evaluate_model(path, X_test, y_test, "Neural Network", th))
 
     if results:
         print(f"\n{'═' * 60}")

@@ -1,7 +1,7 @@
 """
 model.py — Train incident-prediction models and tune alert thresholds.
 
-Models: LightGBM (primary) + XGBoost (baseline).
+Models: Neural Network (MLP) (primary) + LightGBM (baseline).
 The best threshold is selected on the validation set using a recall-first
 strategy: find the highest threshold where incident-level recall >= 80%.
 Optuna hyperparameter tuning is available via the --tune flag.
@@ -11,14 +11,16 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+
 try:
     import lightgbm as lgb
+
     _LGBM_AVAILABLE = True
 except (ImportError, OSError) as _lgbm_err:
     lgb = None  # type: ignore[assignment]
     _LGBM_AVAILABLE = False
     _LGBM_IMPORT_ERROR = _lgbm_err
-from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, f1_score
 import joblib
 
@@ -125,23 +127,31 @@ def find_recall_threshold(y_true, y_prob, min_recall: float = 0.80):
 
 
 def train_lgbm(X_train, y_train, X_val, y_val):
-    """Train a LightGBM classifier with class-imbalance handling."""
+    """Train a LightGBM classifier with SMOTE oversampling.
+
+    LightGBM's leaf-wise (best-first) growth strategy struggles with
+    the small rolling-window feature set (7 features) when combined with
+    ``scale_pos_weight`` — the model converges to a near-constant output
+    after just 1 iteration.  Replacing class weighting with SMOTE
+    oversampling resolves this by presenting a balanced training set,
+    allowing gradient boosting to find meaningful splits.
+    """
     if not _LGBM_AVAILABLE:
         raise RuntimeError(
             f"LightGBM could not be imported: {_LGBM_IMPORT_ERROR}\n"
             "On macOS, install the OpenMP runtime with: brew install libomp"
         ) from _LGBM_IMPORT_ERROR
-    n_pos = y_train.sum()
-    n_neg = len(y_train) - n_pos
-    scale = n_neg / max(n_pos, 1)
+    from imblearn.over_sampling import SMOTE
+
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
     model = lgb.LGBMClassifier(
         n_estimators=500,
-        max_depth=4,
-        num_leaves=15,
+        max_depth=6,
+        num_leaves=31,
         learning_rate=0.05,
-        scale_pos_weight=scale,
-        min_child_samples=50,
+        min_child_samples=20,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_alpha=0.1,
@@ -150,8 +160,8 @@ def train_lgbm(X_train, y_train, X_val, y_val):
         verbosity=-1,
     )
     model.fit(
-        X_train,
-        y_train,
+        X_res,
+        y_res,
         eval_set=[(X_val, y_val)],
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(50, verbose=False)],
@@ -159,32 +169,24 @@ def train_lgbm(X_train, y_train, X_val, y_val):
     return model
 
 
-def train_xgb(X_train, y_train, X_val, y_val):
-    """XGBoost baseline with class-imbalance handling and early stopping."""
-    n_pos = y_train.sum()
-    n_neg = len(y_train) - n_pos
-    scale = n_neg / max(n_pos, 1)
+def train_nn(X_train, y_train, X_val, y_val):
+    """Neural Network baseline with SMOTE class-imbalance handling and early stopping."""
+    from imblearn.over_sampling import SMOTE
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    model = XGBClassifier(
-        n_estimators=500,
-        max_depth=4,
-        learning_rate=0.05,
-        scale_pos_weight=scale,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+    model = MLPClassifier(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        solver="adam",
+        alpha=0.0001,
+        learning_rate_init=0.001,
+        max_iter=500,
         random_state=42,
-        eval_metric="logloss",
-        early_stopping_rounds=50,
-        verbosity=0,
+        early_stopping=True,
+        validation_fraction=0.1,
     )
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+    model.fit(X_res, y_res)
     return model
 
 
@@ -193,45 +195,47 @@ def train_xgb(X_train, y_train, X_val, y_val):
 # ---------------------------------------------------------------------------
 
 
-def tune_xgb_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
+def tune_nn_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
     """
-    Search XGBoost hyper-parameters with Optuna.
+    Search Neural Network hyper-parameters with Optuna.
 
     Objective: maximise **incident-level recall** on the validation set,
     which directly targets the ≥ 80 % recall success criterion.
     """
     import optuna
+    from imblearn.over_sampling import SMOTE
 
-    n_pos = y_train.sum()
-    n_neg = len(y_train) - n_pos
-    scale = n_neg / max(n_pos, 1)
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
     def objective(trial: optuna.Trial) -> float:
+        n_layers = trial.suggest_int("n_layers", 1, 3)
+        layers = []
+        for i in range(n_layers):
+            layers.append(trial.suggest_int(f"n_units_l{i}", 16, 128))
+            
         params = {
-            "max_depth": trial.suggest_int("max_depth", 3, 8),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "n_estimators": trial.suggest_int("n_estimators", 100, 700),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "hidden_layer_sizes": tuple(layers),
+            "alpha": trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
+            "learning_rate_init": trial.suggest_float("learning_rate_init", 1e-4, 1e-1, log=True),
         }
-        model = XGBClassifier(
+        model = MLPClassifier(
             **params,
-            scale_pos_weight=scale,
-            reg_lambda=1.0,
+            activation="relu",
+            solver="adam",
+            max_iter=500,
             random_state=42,
-            eval_metric="logloss",
-            early_stopping_rounds=50,
-            verbosity=0,
+            early_stopping=True,
+            validation_fraction=0.1,
         )
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(X_res, y_res)
         y_prob = model.predict_proba(X_val)[:, 1]
         # Use the recall-first threshold, then measure incident recall
         th, rec, _ = find_recall_threshold(y_val, y_prob)
         return rec
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize", study_name="xgb-incident-recall")
+    study = optuna.create_study(direction="maximize", study_name="nn-incident-recall")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     print(f"\n  Optuna best incident recall: {study.best_value:.3f}")
@@ -239,26 +243,29 @@ def tune_xgb_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
 
     # Re-train with best params
     best = study.best_params
-    model = XGBClassifier(
-        **best,
-        scale_pos_weight=scale,
-        reg_lambda=1.0,
+    layers = tuple(best[f"n_units_l{i}"] for i in range(best["n_layers"]))
+    model = MLPClassifier(
+        hidden_layer_sizes=layers,
+        alpha=best["alpha"],
+        learning_rate_init=best["learning_rate_init"],
+        activation="relu",
+        solver="adam",
+        max_iter=500,
         random_state=42,
-        eval_metric="logloss",
-        early_stopping_rounds=50,
-        verbosity=0,
+        early_stopping=True,
+        validation_fraction=0.1,
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model.fit(X_res, y_res)
     return model
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["lgbm", "xgb", "both"], default="both")
+    parser.add_argument("--model", choices=["lgbm", "nn", "both"], default="both")
     parser.add_argument(
         "--tune",
         action="store_true",
-        help="Run Optuna hyperparameter tuning for XGBoost before training.",
+        help="Run Optuna hyperparameter tuning for Neural Network before training.",
     )
     parser.add_argument(
         "--trials",
@@ -284,8 +291,8 @@ def main():
             )
             if args.model == "lgbm":
                 return
-            # fall through to XGBoost when model == "both"
-            args.model = "xgb"
+            # fall through to Neural Network when model == "both"
+            args.model = "nn"
             print()
         lgbm_model = train_lgbm(X_train, y_train, X_val, y_val)
         joblib.dump(lgbm_model, DATA_DIR / "model_lgbm.pkl")
@@ -300,26 +307,26 @@ def main():
         print(f"  Best threshold: {th:.2f}  (inc. recall={rec:.3f}, F1={f1:.3f})")
         print(f"  Saved model_lgbm.pkl")
 
-    if args.model in ("xgb", "both"):
-        print("\n── XGBoost ────────────────────────────────────────")
+    if args.model in ("nn", "both"):
+        print("\n── Neural Network (MLP) ────────────────────────────────────────")
         if args.tune:
             print(f"  Running Optuna tuning ({args.trials} trials)…")
-            xgb_model = tune_xgb_with_optuna(
+            nn_model = tune_nn_with_optuna(
                 X_train, y_train, X_val, y_val, n_trials=args.trials
             )
         else:
-            xgb_model = train_xgb(X_train, y_train, X_val, y_val)
-        joblib.dump(xgb_model, DATA_DIR / "model_xgb.pkl")
-        train_acc = accuracy_score(y_train, xgb_model.predict(X_train))
-        val_prob = xgb_model.predict_proba(X_val)[:, 1]
-        val_acc = accuracy_score(y_val, xgb_model.predict(X_val))
+            nn_model = train_nn(X_train, y_train, X_val, y_val)
+        joblib.dump(nn_model, DATA_DIR / "model_nn.pkl")
+        train_acc = accuracy_score(y_train, nn_model.predict(X_train))
+        val_prob = nn_model.predict_proba(X_val)[:, 1]
+        val_acc = accuracy_score(y_val, nn_model.predict(X_val))
         th, rec, f1 = find_recall_threshold(y_val, val_prob)
-        thresholds["xgb"] = th
+        thresholds["nn"] = th
         print(f"  Train accuracy:  {train_acc:.4f}")
         print(f"  Val accuracy:    {val_acc:.4f}")
         print(f"  Val prob range: [{val_prob.min():.3f}, {val_prob.max():.3f}]")
         print(f"  Best threshold: {th:.2f}  (inc. recall={rec:.3f}, F1={f1:.3f})")
-        print(f"  Saved model_xgb.pkl")
+        print(f"  Saved model_nn.pkl")
 
     # Save thresholds for evaluate.py
     joblib.dump(thresholds, DATA_DIR / "thresholds.pkl")

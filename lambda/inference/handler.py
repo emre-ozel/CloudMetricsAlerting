@@ -13,7 +13,7 @@ What it does
 3. Applies online EMA normalisation (RunningStats) to produce z-score
    normalised values consistent with training.
 4. Extracts the 7-feature vector for the most-recent window.
-5. Runs predict_proba with both LightGBM and XGBoost.
+5. Runs predict_proba with both LightGBM and Neural Network.
 6. If the *ensemble* probability (average of the two models) exceeds the
    tuned threshold, publishes a structured JSON alert to SNS.
 7. Emits a custom CloudWatch metric ("IncidentRisk") for each monitored
@@ -25,7 +25,7 @@ Environment variables
   ARTIFACT_PREFIX   – S3 key prefix (default: "alerting/models/")
   SNS_TOPIC_ARN     – SNS topic to publish alerts to
   METRICS_CONFIG    – JSON string (same format as retrain handler)
-  ALERT_MODEL       – Which model to use: "lgbm", "xgb", or "ensemble" (default)
+  ALERT_MODEL       – Which model to use: "lgbm", "nn", or "ensemble" (default)
   AWS_REGION        – Injected by Lambda runtime
 """
 
@@ -70,7 +70,7 @@ s3 = boto3.client("s3", region_name=REGION)
 sns = boto3.client("sns", region_name=REGION)
 
 # ── In-memory artifact cache (survives across warm Lambda invocations) ────────
-_cache: dict[str, Any] = {}  # {"lgbm": model, "xgb": model, "thresholds": dict}
+_cache: dict[str, Any] = {}  # {"lgbm": model, "nn": model, "thresholds": dict}
 _cache_etag: dict[str, str] = {}  # ETag → know when S3 artifact changed
 _running_stats: dict[str, RunningStats] = {}  # metric_key → RunningStats
 
@@ -107,11 +107,11 @@ def _load_artifact_if_changed(key_suffix: str, cache_name: str) -> Any:
 
 
 def load_models_and_thresholds() -> tuple[Any, Any, dict]:
-    """Return (lgbm_model, xgb_model, thresholds)."""
+    """Return (lgbm_model, nn_model, thresholds)."""
     lgbm = _load_artifact_if_changed("model_lgbm_latest.pkl", "lgbm")
-    xgb = _load_artifact_if_changed("model_xgb_latest.pkl", "xgb")
+    nn = _load_artifact_if_changed("model_nn_latest.pkl", "nn")
     thresholds = _load_artifact_if_changed("thresholds_latest.pkl", "thresholds")
-    return lgbm, xgb, thresholds
+    return lgbm, nn, thresholds
 
 
 # ── CloudWatch data fetching ──────────────────────────────────────────────────
@@ -177,7 +177,7 @@ def fetch_recent_values(
 def predict_risk(
     values: np.ndarray,
     lgbm_model: Any,
-    xgb_model: Any,
+    nn_model: Any,
     metric_key: str,
 ) -> float:
     """
@@ -192,14 +192,14 @@ def predict_risk(
         return 0.0
 
     p_lgbm = float(lgbm_model.predict_proba(feat)[0, 1])
-    p_xgb = float(xgb_model.predict_proba(feat)[0, 1])
+    p_nn = float(nn_model.predict_proba(feat)[0, 1])
 
     if ALERT_MODEL == "lgbm":
         return p_lgbm
-    elif ALERT_MODEL == "xgb":
-        return p_xgb
+    elif ALERT_MODEL == "nn":
+        return p_nn
     else:  # "ensemble"
-        return (p_lgbm + p_xgb) / 2.0
+        return (p_lgbm + p_nn) / 2.0
 
 
 # ── SNS alerting ──────────────────────────────────────────────────────────────
@@ -268,16 +268,16 @@ def handler(event: dict, context: Any) -> dict:
     invocation_ts = datetime.now(timezone.utc).isoformat()
 
     # 1. Load models (cached; re-downloads only if ETag changed in S3)
-    lgbm_model, xgb_model, thresholds = load_models_and_thresholds()
+    lgbm_model, nn_model, thresholds = load_models_and_thresholds()
 
     # Ensemble threshold: average of the two individual thresholds
     th_lgbm = thresholds.get("lgbm", 0.14)
-    th_xgb = thresholds.get("xgb", 0.46)
-    ensemble_threshold = (th_lgbm + th_xgb) / 2.0
+    th_nn = thresholds.get("nn", 0.46)
+    ensemble_threshold = (th_lgbm + th_nn) / 2.0
 
     threshold = {
         "lgbm": th_lgbm,
-        "xgb": th_xgb,
+        "nn": th_nn,
         "ensemble": ensemble_threshold,
     }.get(ALERT_MODEL, ensemble_threshold)
 
@@ -306,7 +306,7 @@ def handler(event: dict, context: Any) -> dict:
                 continue
 
             # Compute incident risk
-            risk = predict_risk(values, lgbm_model, xgb_model, metric_key)
+            risk = predict_risk(values, lgbm_model, nn_model, metric_key)
 
             # Emit custom CloudWatch metric
             emit_risk_metric(cfg, risk)

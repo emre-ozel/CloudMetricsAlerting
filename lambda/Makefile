@@ -36,7 +36,7 @@ layer:
 	    --python-version 3.12                       \
 	    --only-binary=:all:                         \
 	    --target layer/python                       \
-	    numpy scikit-learn lightgbm xgboost joblib boto3
+	    numpy scikit-learn lightgbm joblib boto3
 	# Copy shared utilities into the layer
 	cp -r shared layer/python/shared
 	@echo "Layer ready at layer/python/"
