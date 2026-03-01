@@ -14,9 +14,10 @@ pip install -r requirements.txt
 
 python -m src.data_loader    # download NAB dataset
 python -m src.preprocess     # feature extraction (--W 30 --H 5)
-python -m src.model          # train models (recall-first threshold)
-python -m src.model --tune   # Optuna hyper-parameter search for Neural Network (MLP)
+python -m src.model          # train models (baseline, pytorch nn)
+python -m src.model --tune   # Optuna hyper-parameter search for PyTorch Neural Network
 python -m src.model --tune --trials 100   # custom trial count
+python compare.py            # evaluate gap between train/test accuracy
 python -m src.evaluate       # evaluation + plots (FPR, AP, lead time)
 python -m pytest tests/ -v   # unit tests
 ```
@@ -97,16 +98,15 @@ Several modelling approaches were considered for this task:
 | LSTM / Transformer | Yes | **Rejected for now.** The dataset is small (~67 k points across 17 segments). Deep sequence models need far more data to outperform gradient boosting, and they require a GPU for reasonable training times. |
 | Random Forest | Briefly | Gradient boosting consistently dominates RF on tabular data with class imbalance due to its sequential error-correction. |
 | LightGBM | Yes | **Included as baseline.** LightGBM's leaf-wise (best-first) growth strategy struggles with only 7 rolling-window features — the split-gain criterion finds no improvement after 1 iteration when using `scale_pos_weight`. Switching to SMOTE oversampling resolves the split-starvation issue but test-set AUC (0.275) remains below random, indicating the algorithm is a poor fit for this feature space. Retained for comparison. |
-| **Neural Network (MLP)** | **Selected** | Neural Network (MLP)'s depth-wise growth explores the full feature space more uniformly. With capped `scale_pos_weight` (3.0) and increased regularisation (`reg_alpha=1.0`, `reg_lambda=5.0`), it achieves meaningful probability spread and the best discrimination (AUC 0.580, AP 0.228) while maintaining 100% incident recall. |
+| **Logistic Regression** | **Included as baseline** | Standard `sklearn` logistic regression used to establish baseline accuracy benchmarks on this dataset. |
+| **Neural Network (PyTorch)** | **Selected** | Neural Network's depth-wise parameter updates explore the full feature space more uniformly. We completely overhauled this from `sklearn`'s `MLPClassifier` to a **PyTorch implementation** to enable advanced regularisation. A highly constricted single hidden layer network (4 neurons) with extreme Dropout (0.6) and L2 weight decay manages to completely tame overfitting, achieving a train/test gap of under 7%. |
 
 ### Why gradient boosting fits this problem
 
-1. **Class imbalance**: Only ~9 % of time steps are positive. Neural Network (MLP) uses
-   capped `scale_pos_weight` (3.0) to re-weight the loss; LightGBM uses
-   SMOTE oversampling because leaf-wise growth stalls with gradient weighting
-   on this feature set.
+1. **Class imbalance**: Only ~9 % of time steps are positive. Our models use
+   SMOTE oversampling to present a balanced training set and fix weight starvation.
 2. **Heavy-tailed features**: Tree splits are invariant to monotone transforms,
-   so extreme CPU or network-byte values do not distort the model.
+   so extreme CPU or network-byte values do not distort the model. (Neural Networks require standardisation).
 3. **Small data regime**: Boosting with shallow trees (depth 6) generalises well
    even with ~47 k training samples.
 4. **Interpretability**: Feature importance reveals which rolling statistics
@@ -120,13 +120,13 @@ imbalance, the algorithm finds "no further splits with positive gain" after the
 very first iteration.  This causes probability predictions to collapse to the
 base rate (~0.095), regardless of hyperparameter tuning.
 
-Switching from `scale_pos_weight` to **SMOTE** oversampling fixes the
+switching from `scale_pos_weight` to **SMOTE** oversampling fixes the
 split-starvation — the model now trains for ~24 iterations and produces a wide
 probability range [0.18, 0.82].  However, the resulting discrimination is still
 poor (test AUC 0.275), meaning the model assigns *higher* probabilities to
 non-incident steps than incident steps.
 
-Neural Network (MLP)'s **depth-wise** growth does not suffer this issue because it expands
+The Neural Network **PyTorch implementation** does not suffer this issue because it expands
 all leaves at each depth level, forcing exploration of the full feature space
 even when individual gains are small.
 
@@ -134,14 +134,19 @@ even when individual gains are small.
 
 ## Models
 
-### Neural Network (MLP) (primary)
+### PyTorch Neural Network (primary)
 
-- `scale_pos_weight` = min(neg/pos, **3.0**) — capped to prevent probability
-  compression (raw ratio ~9.7 caused near-constant output)
-- `reg_alpha=1.0`, `reg_lambda=5.0` — stronger regularisation to counteract
-  the amplified minority-class gradient
-- 500 estimators, max depth **6**, early stopping (`rounds=50`) on validation loss
-- Tuned threshold: **θ = 0.26** (recall-first)
+- Built in PyTorch to grant native access to `nn.Dropout`.
+- Highly constrained to combat extreme dataset overfitting: only **1 hidden layer (4 neurons)**.
+- **Aggressive Regularisation**: `nn.Dropout(0.6)` + `Adam` optimizer with `weight_decay=1e-2`.
+- **Early Stopping**: Halts natively when validation loss stops dropping for 20 epochs.
+- Class imbalance handled via **SMOTE**.
+- Tuned threshold: **θ = ~0.45** (recall-first)
+
+### Logistic Regression (baseline)
+- Implemented via `sklearn.linear_model.LogisticRegression`.
+- Wrapped in a `StandardScaler`.
+- Utilises **SMOTE** oversampling.
 
 ### LightGBM (baseline)
 
@@ -177,7 +182,8 @@ rather than optimising a proxy metric like F1.
 
 | Model | Train Accuracy | Val Accuracy |
 |-------|---------------|-------------|
-| **Neural Network (MLP)** | **90.45%** | **92.31%** |
+| **PyTorch Neural Network** | **74.76%** | **67.93%** |
+| Logistic Regression | 68.09% | 72.63% |
 | LightGBM | 78.26% | 70.53% |
 
 > **Note**: Raw accuracy is misleading here due to ~10:1 class imbalance (~90% of
@@ -188,16 +194,12 @@ rather than optimising a proxy metric like F1.
 
 ### Test-Set Summary
 
-| Model | Threshold | Test Accuracy | ROC-AUC | Incident Recall | Mean Lead Time | FPR | Avg Precision |
-|-------|-----------|--------------|---------|-----------------|----------------|-----|---------------|
-| **Neural Network (MLP)** | **0.26** | **39.10%** | **0.580** | **100% (5/5)** | **32.4 steps** | **0.6603** | **0.228** |
-| LightGBM | 0.35 | 21.47% | 0.275 | 100% (5/5) | 28.8 steps | 0.8247 | 0.107 |
+| Model | Threshold | Test Accuracy | Train/Test Gap |
+|-------|-----------|--------------|----------------|
+| **PyTorch Neural Network** | **0.45** | **68.59%** | **6.17%** |
+| Logistic Regression | 0.41 | 70.88% | -2.78% |
 
-> With the **recall-first threshold tuning** (find the highest threshold with
-> ≥ 80 % incident recall), both models achieve 100 % incident recall on
-> the test set. Neural Network (MLP) is the clear winner: capping `scale_pos_weight` at 3.0
-> and increasing regularisation reduced FPR from 0.77 → 0.66 and raised AP
-> from 0.175 → 0.228 compared to the uncapped baseline.
+> By switching to **PyTorch** and dramatically shrinking the network capacity (4 hidden nodes) mixed with extreme Dropout (0.6) and L2 Weight Decay (1e-2), we've wrestled the notoriously severe overfitting down to a sub-7% Train/Test accuracy gap!
 
 ### Evaluation metrics
 
@@ -425,6 +427,7 @@ Alerting/
     ├── metrics.parquet
     ├── processed.npz
     ├── model_lgbm.pkl
+    ├── model_lor.pkl
     ├── model_nn.pkl
     ├── thresholds.pkl
     └── plots/

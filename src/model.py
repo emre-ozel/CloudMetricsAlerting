@@ -20,9 +20,16 @@ except (ImportError, OSError) as _lgbm_err:
     lgb = None  # type: ignore[assignment]
     _LGBM_AVAILABLE = False
     _LGBM_IMPORT_ERROR = _lgbm_err
-from sklearn.neural_network import MLPClassifier
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 import joblib
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import copy
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -169,110 +176,135 @@ def train_lgbm(X_train, y_train, X_val, y_val):
     return model
 
 
-def train_nn(X_train, y_train, X_val, y_val):
-    """Neural Network baseline with SMOTE class-imbalance handling and early stopping."""
+def train_lor(X_train, y_train):
+    """Logistic Regression baseline with SMOTE handling class imbalance and scaling."""
     from imblearn.over_sampling import SMOTE
+    from sklearn.pipeline import make_pipeline
+
     sm = SMOTE(random_state=42)
     X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    model = MLPClassifier(
-        hidden_layer_sizes=(64, 32),
-        activation="relu",
-        solver="adam",
-        alpha=0.0001,
-        learning_rate_init=0.001,
-        max_iter=500,
-        random_state=42,
-        early_stopping=True,
-        validation_fraction=0.1,
+    model = make_pipeline(
+        StandardScaler(), LogisticRegression(random_state=42, max_iter=1000)
     )
     model.fit(X_res, y_res)
     return model
 
 
-# ---------------------------------------------------------------------------
-# Optuna hyperparameter tuning
-# ---------------------------------------------------------------------------
-
-
-def tune_nn_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
-    """
-    Search Neural Network hyper-parameters with Optuna.
-
-    Objective: maximise **incident-level recall** on the validation set,
-    which directly targets the ≥ 80 % recall success criterion.
-    """
-    import optuna
-    from imblearn.over_sampling import SMOTE
-
-    sm = SMOTE(random_state=42)
-    X_res, y_res = sm.fit_resample(X_train, y_train)
-
-    def objective(trial: optuna.Trial) -> float:
-        n_layers = trial.suggest_int("n_layers", 1, 3)
-        layers = []
-        for i in range(n_layers):
-            layers.append(trial.suggest_int(f"n_units_l{i}", 16, 128))
-            
-        params = {
-            "hidden_layer_sizes": tuple(layers),
-            "alpha": trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
-            "learning_rate_init": trial.suggest_float("learning_rate_init", 1e-4, 1e-1, log=True),
-        }
-        model = MLPClassifier(
-            **params,
-            activation="relu",
-            solver="adam",
-            max_iter=500,
-            random_state=42,
-            early_stopping=True,
-            validation_fraction=0.1,
+class SimplifiedNN(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        # Simplified: Only 1 hidden layer with 4 neurons, aggressive dropout
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 4),
+            nn.ReLU(),
+            nn.Dropout(0.6),
+            nn.Linear(4, 1),
+            nn.Sigmoid(),
         )
-        model.fit(X_res, y_res)
-        y_prob = model.predict_proba(X_val)[:, 1]
-        # Use the recall-first threshold, then measure incident recall
-        th, rec, _ = find_recall_threshold(y_val, y_prob)
-        return rec
 
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize", study_name="nn-incident-recall")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
-    print(f"\n  Optuna best incident recall: {study.best_value:.3f}")
-    print(f"  Best params: {study.best_params}")
 
-    # Re-train with best params
-    best = study.best_params
-    layers = tuple(best[f"n_units_l{i}"] for i in range(best["n_layers"]))
-    model = MLPClassifier(
-        hidden_layer_sizes=layers,
-        alpha=best["alpha"],
-        learning_rate_init=best["learning_rate_init"],
-        activation="relu",
-        solver="adam",
-        max_iter=500,
-        random_state=42,
-        early_stopping=True,
-        validation_fraction=0.1,
-    )
-    model.fit(X_res, y_res)
-    return model
+class PyTorchNNClassifier:
+    """Wrapper to make PyTorch model behave like a scikit-learn classifier"""
+
+    def __init__(self, model, scaler):
+        self.model = model
+        self.scaler = scaler
+
+    def predict_proba(self, X):
+        self.model.eval()
+        X_scaled = self.scaler.transform(X)
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_scaled)
+            probs = self.model(X_tensor).numpy()
+
+        # Scikit-learn expects shape (n_samples, 2) for binary classification predict_proba
+        out = np.zeros((len(probs), 2))
+        out[:, 1] = probs
+        out[:, 0] = 1 - probs
+        return out
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+def train_nn(X_train, y_train, X_val, y_val):
+    """Simplified PyTorch Neural Network with SMOTE, Dropout, and Early Stopping."""
+    from imblearn.over_sampling import SMOTE
+
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
+
+    # Scale the data
+    scaler = StandardScaler()
+    X_res_scaled = scaler.fit_transform(X_res)
+    X_val_scaled = scaler.transform(X_val)
+
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.FloatTensor(X_res_scaled)
+    y_train_tensor = torch.FloatTensor(y_res)
+    X_val_tensor = torch.FloatTensor(X_val_scaled)
+    y_val_tensor = torch.FloatTensor(y_val)
+
+    # Create DataLoaders
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+    input_dim = X_train.shape[1]
+    model = SimplifiedNN(input_dim)
+
+    criterion = nn.BCELoss()
+    # Add heavy L2 Regularization through weight_decay
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-2)
+
+    # Early stopping setup
+    patience = 20
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    best_model_weights = None
+
+    max_epochs = 300
+
+    for epoch in range(max_epochs):
+        model.train()
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+
+        # Validation phase
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor).item()
+
+        # Check early stopping monitor
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_weights = copy.deepcopy(model.state_dict())
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(
+                    f"  Early stopping triggered at epoch {epoch}. Best val loss: {best_val_loss:.4f}"
+                )
+                break
+
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
+
+    return PyTorchNNClassifier(model, scaler)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["lgbm", "nn", "both"], default="both")
-    parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run Optuna hyperparameter tuning for Neural Network before training.",
-    )
-    parser.add_argument(
-        "--trials",
-        type=int,
-        default=50,
-        help="Number of Optuna trials (default: 50).",
-    )
+    parser.add_argument("--model", choices=["lgbm", "lor", "nn", "all"], default="all")
     args = parser.parse_args()
 
     X_train, y_train, X_val, y_val, X_test, y_test = load_data()
@@ -281,7 +313,7 @@ def main():
 
     thresholds = {}
 
-    if args.model in ("lgbm", "both"):
+    if args.model in ("lgbm", "all"):
         print("\n── LightGBM ──────────────────────────────────────")
         if not _LGBM_AVAILABLE:
             print(
@@ -289,33 +321,38 @@ def main():
                 "  On macOS run: brew install libomp\n"
                 "  Skipping LightGBM training."
             )
-            if args.model == "lgbm":
-                return
-            # fall through to Neural Network when model == "both"
-            args.model = "nn"
-            print()
-        lgbm_model = train_lgbm(X_train, y_train, X_val, y_val)
-        joblib.dump(lgbm_model, DATA_DIR / "model_lgbm.pkl")
-        train_acc = accuracy_score(y_train, lgbm_model.predict(X_train))
-        val_prob = lgbm_model.predict_proba(X_val)[:, 1]
-        val_acc = accuracy_score(y_val, lgbm_model.predict(X_val))
+        else:
+            lgbm_model = train_lgbm(X_train, y_train, X_val, y_val)
+            joblib.dump(lgbm_model, DATA_DIR / "model_lgbm.pkl")
+            train_acc = accuracy_score(y_train, lgbm_model.predict(X_train))
+            val_prob = lgbm_model.predict_proba(X_val)[:, 1]
+            val_acc = accuracy_score(y_val, lgbm_model.predict(X_val))
+            th, rec, f1 = find_recall_threshold(y_val, val_prob)
+            thresholds["lgbm"] = th
+            print(f"  Train accuracy:  {train_acc:.4f}")
+            print(f"  Val accuracy:    {val_acc:.4f}")
+            print(f"  Val prob range: [{val_prob.min():.3f}, {val_prob.max():.3f}]")
+            print(f"  Best threshold: {th:.2f}  (inc. recall={rec:.3f}, F1={f1:.3f})")
+            print(f"  Saved model_lgbm.pkl")
+
+    if args.model in ("lor", "all"):
+        print("\n── Logistic Regression (Baseline) ──────────────────────────────────")
+        lor_model = train_lor(X_train, y_train)
+        joblib.dump(lor_model, DATA_DIR / "model_lor.pkl")
+        train_acc = accuracy_score(y_train, lor_model.predict(X_train))
+        val_prob = lor_model.predict_proba(X_val)[:, 1]
+        val_acc = accuracy_score(y_val, lor_model.predict(X_val))
         th, rec, f1 = find_recall_threshold(y_val, val_prob)
-        thresholds["lgbm"] = th
+        thresholds["lor"] = th
         print(f"  Train accuracy:  {train_acc:.4f}")
         print(f"  Val accuracy:    {val_acc:.4f}")
         print(f"  Val prob range: [{val_prob.min():.3f}, {val_prob.max():.3f}]")
         print(f"  Best threshold: {th:.2f}  (inc. recall={rec:.3f}, F1={f1:.3f})")
-        print(f"  Saved model_lgbm.pkl")
+        print(f"  Saved model_lor.pkl")
 
-    if args.model in ("nn", "both"):
-        print("\n── Neural Network (MLP) ────────────────────────────────────────")
-        if args.tune:
-            print(f"  Running Optuna tuning ({args.trials} trials)…")
-            nn_model = tune_nn_with_optuna(
-                X_train, y_train, X_val, y_val, n_trials=args.trials
-            )
-        else:
-            nn_model = train_nn(X_train, y_train, X_val, y_val)
+    if args.model in ("nn", "all"):
+        print("\n── Simplified PyTorch Neural Network ─────────────────────────────")
+        nn_model = train_nn(X_train, y_train, X_val, y_val)
         joblib.dump(nn_model, DATA_DIR / "model_nn.pkl")
         train_acc = accuracy_score(y_train, nn_model.predict(X_train))
         val_prob = nn_model.predict_proba(X_val)[:, 1]
