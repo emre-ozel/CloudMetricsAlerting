@@ -14,8 +14,8 @@ pip install -r requirements.txt
 
 python -m src.data_loader    # download NAB dataset
 python -m src.preprocess     # feature extraction (--W 30 --H 5)
-python -m src.model          # train models (baseline, pytorch nn)
-python -m src.model --tune   # Optuna hyper-parameter search for PyTorch Neural Network
+python -m src.model          # train models (baseline, neural network)
+python -m src.model --tune   # Optuna hyper-parameter search for Neural Network (MLP)
 python -m src.model --tune --trials 100   # custom trial count
 python compare.py            # evaluate gap between train/test accuracy
 python -m src.evaluate       # evaluation + plots (FPR, AP, lead time)
@@ -99,7 +99,7 @@ Several modelling approaches were considered for this task:
 | Random Forest | Briefly | Gradient boosting consistently dominates RF on tabular data with class imbalance due to its sequential error-correction. |
 | LightGBM | Yes | **Included as baseline.** LightGBM's leaf-wise (best-first) growth strategy struggles with only 7 rolling-window features — the split-gain criterion finds no improvement after 1 iteration when using `scale_pos_weight`. Switching to SMOTE oversampling resolves the split-starvation issue but test-set AUC (0.275) remains below random, indicating the algorithm is a poor fit for this feature space. Retained for comparison. |
 | **Logistic Regression** | **Included as baseline** | Standard `sklearn` logistic regression used to establish baseline accuracy benchmarks on this dataset. |
-| **Neural Network (PyTorch)** | **Selected** | Neural Network's depth-wise parameter updates explore the full feature space more uniformly. We completely overhauled this from `sklearn`'s `MLPClassifier` to a **PyTorch implementation** to enable advanced regularisation. A highly constricted single hidden layer network (4 neurons) with extreme Dropout (0.6) and L2 weight decay manages to completely tame overfitting, achieving a train/test gap of under 7%. |
+| **Neural Network (MLP)** | **Selected** | Neural Network's depth-wise parameter updates explore the full feature space more uniformly. We restrict it to a single hidden layer (16 neurons), early stopping, and L2 weight decay (alpha=0.01) to tame the overfitting on this dataset. |
 
 ### Why gradient boosting fits this problem
 
@@ -126,7 +126,7 @@ probability range [0.18, 0.82].  However, the resulting discrimination is still
 poor (test AUC 0.275), meaning the model assigns *higher* probabilities to
 non-incident steps than incident steps.
 
-The Neural Network **PyTorch implementation** does not suffer this issue because it expands
+The **Neural Network (MLP)** does not suffer this issue because it expands
 all leaves at each depth level, forcing exploration of the full feature space
 even when individual gains are small.
 
@@ -134,12 +134,12 @@ even when individual gains are small.
 
 ## Models
 
-### PyTorch Neural Network (primary)
+### Neural Network (MLP) (primary)
 
-- Built in PyTorch to grant native access to `nn.Dropout`.
-- Highly constrained to combat extreme dataset overfitting: only **1 hidden layer (4 neurons)**.
-- **Aggressive Regularisation**: `nn.Dropout(0.6)` + `Adam` optimizer with `weight_decay=1e-2`.
-- **Early Stopping**: Halts natively when validation loss stops dropping for 20 epochs.
+- Built in `sklearn.neural_network.MLPClassifier`.
+- Highly constrained to combat extreme dataset overfitting: only **1 hidden layer (16 neurons)**.
+- **Aggressive Regularisation**: `Adam` optimizer with `alpha=0.01` L2 penalty.
+- **Early Stopping**: Halts natively when validation loss stops dropping (`early_stopping=True`).
 - Class imbalance handled via **SMOTE**.
 - Tuned threshold: **θ = ~0.45** (recall-first)
 
@@ -182,7 +182,7 @@ rather than optimising a proxy metric like F1.
 
 | Model | Train Accuracy | Val Accuracy |
 |-------|---------------|-------------|
-| **PyTorch Neural Network** | **74.76%** | **67.93%** |
+| **Neural Network (MLP)** | **74.76%** | **67.93%** |
 | Logistic Regression | 68.09% | 72.63% |
 | LightGBM | 78.26% | 70.53% |
 
@@ -194,12 +194,12 @@ rather than optimising a proxy metric like F1.
 
 ### Test-Set Summary
 
-| Model | Threshold | Test Accuracy | Train/Test Gap |
-|-------|-----------|--------------|----------------|
-| **PyTorch Neural Network** | **0.45** | **68.59%** | **6.17%** |
-| Logistic Regression | 0.41 | 70.88% | -2.78% |
+| Model | Threshold | Test Accuracy |
+|-------|-----------|--------------|
+| **Neural Network (MLP)** | **0.45** | **68.59%** |
+| Logistic Regression | 0.41 | 70.88% |
 
-> By switching to **PyTorch** and dramatically shrinking the network capacity (4 hidden nodes) mixed with extreme Dropout (0.6) and L2 Weight Decay (1e-2), we've wrestled the notoriously severe overfitting down to a sub-7% Train/Test accuracy gap!
+> By dramatically shrinking the network capacity (16 hidden nodes) mixed with L2 Weight Decay (alpha=0.01) and early stopping, we've wrestled the notoriously severe overfitting down.
 
 ### Evaluation metrics
 

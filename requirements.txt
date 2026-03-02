@@ -8,4 +8,3 @@ pyarrow
 optuna
 joblib
 pytest
-torch

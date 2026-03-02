@@ -21,15 +21,11 @@ except (ImportError, OSError) as _lgbm_err:
     _LGBM_AVAILABLE = False
     _LGBM_IMPORT_ERROR = _lgbm_err
 
+from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 import joblib
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import copy
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -191,120 +187,113 @@ def train_lor(X_train, y_train):
     return model
 
 
-class SimplifiedNN(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        # Simplified: Only 1 hidden layer with 4 neurons, aggressive dropout
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 4),
-            nn.ReLU(),
-            nn.Dropout(0.6),
-            nn.Linear(4, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-class PyTorchNNClassifier:
-    """Wrapper to make PyTorch model behave like a scikit-learn classifier"""
-
-    def __init__(self, model, scaler):
-        self.model = model
-        self.scaler = scaler
-
-    def predict_proba(self, X):
-        self.model.eval()
-        X_scaled = self.scaler.transform(X)
-        with torch.no_grad():
-            X_tensor = torch.FloatTensor(X_scaled)
-            probs = self.model(X_tensor).numpy()
-
-        # Scikit-learn expects shape (n_samples, 2) for binary classification predict_proba
-        out = np.zeros((len(probs), 2))
-        out[:, 1] = probs
-        out[:, 0] = 1 - probs
-        return out
-
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-
 def train_nn(X_train, y_train, X_val, y_val):
-    """Simplified PyTorch Neural Network with SMOTE, Dropout, and Early Stopping."""
+    """Neural Network baseline with SMOTE class-imbalance handling and early stopping."""
     from imblearn.over_sampling import SMOTE
 
     sm = SMOTE(random_state=42)
     X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    # Scale the data
-    scaler = StandardScaler()
-    X_res_scaled = scaler.fit_transform(X_res)
-    X_val_scaled = scaler.transform(X_val)
+    model = MLPClassifier(
+        hidden_layer_sizes=(16,),
+        activation="relu",
+        solver="adam",
+        alpha=0.01,
+        learning_rate_init=0.001,
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1,
+    )
+    model.fit(X_res, y_res)
+    return model
 
-    # Convert to PyTorch tensors
-    X_train_tensor = torch.FloatTensor(X_res_scaled)
-    y_train_tensor = torch.FloatTensor(y_res)
-    X_val_tensor = torch.FloatTensor(X_val_scaled)
-    y_val_tensor = torch.FloatTensor(y_val)
 
-    # Create DataLoaders
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+# ---------------------------------------------------------------------------
+# Optuna hyperparameter tuning
+# ---------------------------------------------------------------------------
 
-    input_dim = X_train.shape[1]
-    model = SimplifiedNN(input_dim)
 
-    criterion = nn.BCELoss()
-    # Add heavy L2 Regularization through weight_decay
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-2)
+def tune_nn_with_optuna(X_train, y_train, X_val, y_val, n_trials: int = 50):
+    """
+    Search Neural Network hyper-parameters with Optuna.
 
-    # Early stopping setup
-    patience = 20
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
-    best_model_weights = None
+    Objective: maximise **incident-level recall** on the validation set,
+    which directly targets the ≥ 80 % recall success criterion.
+    """
+    import optuna
+    from imblearn.over_sampling import SMOTE
 
-    max_epochs = 300
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    for epoch in range(max_epochs):
-        model.train()
-        for batch_X, batch_y in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+    def objective(trial: optuna.Trial) -> float:
+        n_layers = trial.suggest_int("n_layers", 1, 2)
+        layers = []
+        for i in range(n_layers):
+            layers.append(trial.suggest_int(f"n_units_l{i}", 8, 32))
 
-        # Validation phase
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(X_val_tensor)
-            val_loss = criterion(val_outputs, y_val_tensor).item()
+        params = {
+            "hidden_layer_sizes": tuple(layers),
+            "alpha": trial.suggest_float("alpha", 1e-4, 1e-1, log=True),
+            "learning_rate_init": trial.suggest_float(
+                "learning_rate_init", 1e-4, 1e-1, log=True
+            ),
+        }
+        model = MLPClassifier(
+            **params,
+            activation="relu",
+            solver="adam",
+            max_iter=500,
+            random_state=42,
+            early_stopping=True,
+            validation_fraction=0.1,
+        )
+        model.fit(X_res, y_res)
+        y_prob = model.predict_proba(X_val)[:, 1]
+        # Use the recall-first threshold, then measure incident recall
+        th, rec, _ = find_recall_threshold(y_val, y_prob)
+        return rec
 
-        # Check early stopping monitor
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            best_model_weights = copy.deepcopy(model.state_dict())
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(
-                    f"  Early stopping triggered at epoch {epoch}. Best val loss: {best_val_loss:.4f}"
-                )
-                break
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="maximize", study_name="nn-incident-recall")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    if best_model_weights is not None:
-        model.load_state_dict(best_model_weights)
+    print(f"\n  Optuna best incident recall: {study.best_value:.3f}")
+    print(f"  Best params: {study.best_params}")
 
-    return PyTorchNNClassifier(model, scaler)
+    # Re-train with best params
+    best = study.best_params
+    layers = tuple(best[f"n_units_l{i}"] for i in range(best["n_layers"]))
+    model = MLPClassifier(
+        hidden_layer_sizes=layers,
+        alpha=best["alpha"],
+        learning_rate_init=best["learning_rate_init"],
+        activation="relu",
+        solver="adam",
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1,
+    )
+    model.fit(X_res, y_res)
+    return model
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["lgbm", "lor", "nn", "all"], default="all")
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run Optuna hyperparameter tuning for Neural Network before training.",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=50,
+        help="Number of Optuna trials (default: 50).",
+    )
     args = parser.parse_args()
 
     X_train, y_train, X_val, y_val, X_test, y_test = load_data()
@@ -351,8 +340,14 @@ def main():
         print(f"  Saved model_lor.pkl")
 
     if args.model in ("nn", "all"):
-        print("\n── Simplified PyTorch Neural Network ─────────────────────────────")
-        nn_model = train_nn(X_train, y_train, X_val, y_val)
+        print("\n── Simplified Neural Network (MLP) ─────────────────────────────")
+        if args.tune:
+            print(f"  Running Optuna tuning ({args.trials} trials)…")
+            nn_model = tune_nn_with_optuna(
+                X_train, y_train, X_val, y_val, n_trials=args.trials
+            )
+        else:
+            nn_model = train_nn(X_train, y_train, X_val, y_val)
         joblib.dump(nn_model, DATA_DIR / "model_nn.pkl")
         train_acc = accuracy_score(y_train, nn_model.predict(X_train))
         val_prob = nn_model.predict_proba(X_val)[:, 1]
