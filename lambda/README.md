@@ -1,7 +1,6 @@
 # Lambda Deployment — Predictive Alerting Pipeline
 
-Two AWS Lambda functions that mirror the local `src/` pipeline in a
-production-grade, event-driven architecture.
+This directory contains the AWS Lambda setup for taking our local `src/` pipeline and turning it into a production-ready, event-driven alerting system in the cloud.
 
 ```
 EventBridge (daily)          EventBridge (every minute)
@@ -135,33 +134,27 @@ make logs-inference
 
 ## How it works
 
-### RetrainFunction (daily, 02:00 UTC)
+### RetrainFunction (Daily, 02:00 UTC)
 
-1. Calls `cloudwatch.get_metric_statistics` for each entry in `METRICS_CONFIG`,
-   fetching up to `LOOKBACK_DAYS` days of 1-minute averages.
-2. Applies the same **sliding-window feature extraction** as `src/preprocess.py`
-   (7 features: mean, std, min, max, last, slope, roc over a W=30 look-back).
-3. Splits data temporally (70/15/15) and trains both LightGBM and Neural Network with
-   SMOTE/class-weighting to handle the ~10:1 class imbalance.
-4. Sweeps thresholds on the validation set and picks the one maximising F1.
-5. Uploads all artifacts to S3 as both **timestamped** and **`_latest`** keys:
+Every night, this function wakes up to make sure our models stay fresh:
+1. It pulls the last `LOOKBACK_DAYS` of 1-minute metrics from CloudWatch for the resources tracked in `METRICS_CONFIG`.
+2. It runs the exact same **sliding-window feature extraction** we use locally (mean, std, min, max, last, slope, roc over a 30-step window).
+3. It splits the data temporally (70/15/15) and trains our models, applying SMOTE/class-weighting to handle the massive lack of incident data.
+4. It sweeps through potential thresholds on the validation set to find the sweet spot for alerting.
+5. Finally, it stashes the updated models and thresholds in S3 as both **timestamped** and **`_latest`** files, so we always have an audit trail.
    - `alerting/models/prod/model_lgbm_20260227T020000.pkl`
    - `alerting/models/prod/model_lgbm_latest.pkl`  ← inference always reads this
    - `alerting/models/prod/thresholds_latest.pkl`
 
-### InferenceFunction (every minute)
+### InferenceFunction (Every Minute)
 
-1. Calls `s3.head_object` on the `_latest` artifacts. Only re-downloads if the
-   **ETag has changed** — models survive across warm container invocations.
-2. Fetches the last `W + 60` minutes of data per metric (60-point buffer guards
-   against CloudWatch data latency and missing points).
-3. Uses **online EMA normalisation** (`RunningStats`, α = 0.01) so the feature
-   scale adapts to slow distribution drift without requiring a full retrain.
-4. Computes ensemble probability: `(p_lgbm + p_nn) / 2`.
-5. Emits a `AlertingPipeline/IncidentRisk/RiskScore` CloudWatch metric per
-   resource — you can graph this and set independent CloudWatch Alarms on it.
-6. Publishes a structured JSON SNS message if `risk ≥ threshold`, with severity
-   tagged `HIGH` (risk > threshold + 0.15) or `MEDIUM`.
+This is the workhorse that runs every minute to keep an eye on things:
+1. It quickly checks the `_latest` artifacts in S3. It only downloads them if the **ETag has changed**, which saves a ton of time on warm starts.
+2. It grabs the last 90 minutes (our window size plus a 60-point buffer) of live CloudWatch data.
+3. It uses a **RunningStats** technique (online EMA normalization, α = 0.01) to gently adapt to slow metric drift, rather than waiting for tomorrow's retraining cycle.
+4. It merges the predictions from our models into a single ensemble score.
+5. It spits out a custom `AlertingPipeline/IncidentRisk/RiskScore` metric back to CloudWatch, so you can draw fancy dashboards or set standard CW Alarms.
+6. If the risk crosses our trained threshold, it fires off an SNS message tagged `HIGH` or `MEDIUM` to wake someone up.
 
 ---
 

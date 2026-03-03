@@ -1,8 +1,6 @@
 # Predictive Alerting for Cloud Metrics
 
-A sliding-window binary classifier that predicts whether an incident will occur
-within the next **H** time steps, using real AWS CloudWatch metrics from the
-[Numenta Anomaly Benchmark (NAB)](https://github.com/numenta/NAB).
+Cloud service metrics can be tricky to model perfectly, but being able to predict an incident before it happens is invaluable. This project implements a sliding-window binary classifier to anticipate incidents within the next **H** time steps. It's trained and evaluated using real-world AWS CloudWatch metrics from the [Numenta Anomaly Benchmark (NAB)](https://github.com/numenta/NAB).
 
 ---
 
@@ -24,147 +22,116 @@ python -m pytest tests/ -v   # unit tests
 
 ---
 
-## Problem Formulation
+## Framing the Problem
+
+We approached this as a binary classification task to answer a simple question: *"Is an incident going to happen in the next H steps?"*
 
 | Aspect | Choice |
 |--------|--------|
 | **Task** | Binary classification: "incident within next H steps?" |
-| **Input** | Sliding window of W steps from a univariate metric |
-| **Output** | Probability p ∈ [0, 1]; alert raised when p ≥ threshold |
-| **Dataset** | NAB `realAWSCloudwatch` — 17 real EC2/RDS/ELB time series |
-| **Defaults** | W = 30 (look-back), H = 5 (horizon) |
+| **Input** | A sliding window of the last **W** steps from a single metric |
+| **Output** | A probability score (0 to 1); alerts trigger when this score crosses a threshold |
+| **Dataset** | NAB `realAWSCloudwatch` (17 real EC2, RDS, and ELB time series) |
+| **Defaults** | W = 30 (our look-back window), H = 5 (prediction horizon) |
 
-### Target construction
+### Defining the Target
 
 For each time step *t*, the label is:
 
-```
-y(t) = 1  if any incident in [t+1, t+H]
+```text
+y(t) = 1  if any incident occurs in [t+1, t+H]
 y(t) = 0  otherwise
 ```
 
-This allows the model to learn *precursor patterns* that appear before incidents.
+This setup gives the model a chance to pick up on the subtle *precursor patterns* that tend to show up right before things go wrong.
 
 ---
 
-## Dataset
+## The Data
 
-The [NAB dataset](https://github.com/numenta/NAB) provides real-world AWS
-CloudWatch metrics collected from EC2 instances, RDS databases, and ELB load
-balancers. Anomaly windows are labeled by domain experts.
+We use the [NAB dataset](https://github.com/numenta/NAB), which contains real AWS CloudWatch metrics from EC2 instances, RDS databases, and ELB load balancers. The anomalies in this dataset were labeled by domain experts, making it a great fit for real-world scenarios.
 
-- **17 segments** (separate AWS resources), **67,740 data points**
-- **Metrics**: CPU utilisation, disk write bytes, network in, request counts
-- **Incident rate**: ~9.3% of time steps fall within an anomaly window
+- **17 segments** (distinct AWS resources) with **67,740 data points** in total.
+- **Metrics tracked**: CPU utilization, disk write bytes, network in, and request counts.
+- **Incident rate**: About ~9.3% of the time steps fall within an anomaly window.
 
-Each segment is **z-score normalised independently** before feature extraction.
-This is critical because different metric types (CPU %, bytes, counts) have
-vastly different scales.
+Because metrics like CPU percentage and network bytes operate on completely different scales, each segment is **z-score normalized independently** before we extract any features.
 
 ---
 
-## Feature Engineering
+## Extracting Features
 
-Seven rolling-window features are extracted per time step:
+For each time step, we extract seven rolling-window features to give the model context:
 
 | # | Feature | Description |
 |---|---------|-------------|
-| 1 | `mean` | Mean value over the window |
-| 2 | `std` | Standard deviation |
-| 3 | `min` | Minimum value |
-| 4 | `max` | Maximum value |
-| 5 | `last` | Most recent value |
-| 6 | `slope` | Linear regression slope |
-| 7 | `roc` | Rate of change (last − first) |
+| 1 | `mean` | Average value over the window |
+| 2 | `std` | Standard deviation (captures volatility) |
+| 3 | `min` | Lowest value |
+| 4 | `max` | Highest value |
+| 5 | `last` | The most recent data point |
+| 6 | `slope` | Slope of the linear regression |
+| 7 | `roc` | Rate of change (difference between last and first) |
 
-The `slope` and `roc` features capture *trends* leading into incidents.
+The `slope` and `roc` features are especially useful for spotting *trends* that build up just before an incident.
 
-### Train / Val / Test Split
+### Training, Validation, and Test Splits
 
-The split is done **within each segment** (70 / 15 / 15% temporally), ensuring
-every split contains samples from every metric type. This avoids the failure
-mode of training on one set of metric types and testing on another.
+To make sure the model doesn't just memorize one type of metric, we split the data **temporally within each segment** (70% train, 15% validation, 15% test). This guarantees that every split gets a taste of every metric type, preventing the classic trap of training on CPU metrics and testing on network metrics.
 
 ---
 
-## Model Selection
+## Choosing the Right Model
 
-Several modelling approaches were considered for this task:
+We explored several approaches before settling on our final architecture. Here's a quick look at our thought process:
 
-| Approach | Considered? | Verdict |
-|----------|------------|---------|
-| ARIMA / SARIMA | Yes | **Rejected.** ARIMA forecasts *values*, not binary incident labels. It also requires stationarity, which the spec explicitly notes is absent in these metrics. |
-| Prophet | Yes | **Rejected.** Designed for daily/weekly seasonality in business metrics; not suited to irregular 5-minute operational spikes. |
-| LSTM / Transformer | Yes | **Rejected for now.** The dataset is small (~67 k points across 17 segments). Deep sequence models need far more data to outperform gradient boosting, and they require a GPU for reasonable training times. |
-| Random Forest | Briefly | Gradient boosting consistently dominates RF on tabular data with class imbalance due to its sequential error-correction. |
-| LightGBM | Yes | **Included as baseline.** LightGBM's leaf-wise (best-first) growth strategy struggles with only 7 rolling-window features — the split-gain criterion finds no improvement after 1 iteration when using `scale_pos_weight`. Switching to SMOTE oversampling resolves the split-starvation issue but test-set AUC (0.275) remains below random, indicating the algorithm is a poor fit for this feature space. Retained for comparison. |
-| **Logistic Regression** | **Included as baseline** | Standard `sklearn` logistic regression used to establish baseline accuracy benchmarks on this dataset. |
-| **Neural Network (MLP)** | **Selected** | Neural Network's depth-wise parameter updates explore the full feature space more uniformly. We restrict it to a single hidden layer (16 neurons), early stopping, and L2 weight decay (alpha=0.01) to tame the overfitting on this dataset. |
+| Approach | Verdict |
+|----------|---------|
+| ARIMA / SARIMA | **Rejected.** They forecast exact values rather than binary labels, and they assume the data is stationary (which ours definitely isn't). |
+| Prophet | **Rejected.** It's great for daily or weekly business seasonality, but not for sporadic 5-minute operational spikes. |
+| LSTM / Transformer | **Rejected.** We only have about 67k points. Deep sequence models need way more data than this to beat simpler models, and they'd require a GPU to train quickly. |
+| Random Forest | **Briefly considered.** Gradient boosting usually beats it on tabular data with class imbalance, so we moved on. |
+| LightGBM (Baseline) | **Included for comparison.** It struggled here. Its leaf-wise growth strategy couldn't do much with just 7 rolling-window features. Even with SMOTE oversampling, it barely performed better than random guessing (test AUC 0.275). |
+| **Logistic Regression** | **Included as a baseline.** A trusty `sklearn` classic to help us set a performance floor. |
+| **Neural Network (MLP)** | **Our top pick.** The layer-wise parameter updates explored our small feature space much better. We kept it small (one hidden layer) and added heavy regularization to keep overfitting in check. |
 
-### Why gradient boosting fits this problem
+### The Struggle with LightGBM
 
-1. **Class imbalance**: Only ~9 % of time steps are positive. Our models use
-   SMOTE oversampling to present a balanced training set and fix weight starvation.
-2. **Heavy-tailed features**: Tree splits are invariant to monotone transforms,
-   so extreme CPU or network-byte values do not distort the model. (Neural Networks require standardisation).
-3. **Small data regime**: Boosting with shallow trees (depth 6) generalises well
-   even with ~47 k training samples.
-4. **Interpretability**: Feature importance reveals which rolling statistics
-   are most predictive, aiding root-cause analysis.
+LightGBM loves to grow trees **leaf-wise (best-first)**, meaning it aggressively splits the leaf with the highest gain. But with only 7 aggregate features and a ~10:1 class imbalance, it quickly ran out of useful splits. It basically gave up after one iteration, defaulting everything to the base rate (~0.095).
 
-### Why LightGBM underperforms Neural Network (MLP) here
+Switching to **SMOTE** oversampling helped keep it training for a bit longer (~24 iterations) and gave us a decent spread of probabilities. Still, the actual prediction quality was poor (test AUC 0.275), meaning it actually assigned *higher* risk scores to normal steps than to actual incidents.
 
-LightGBM uses **leaf-wise (best-first)** tree growth: at each step it splits
-the leaf with the highest gain.  With only 7 aggregate features and ~10:1 class
-imbalance, the algorithm finds "no further splits with positive gain" after the
-very first iteration.  This causes probability predictions to collapse to the
-base rate (~0.095), regardless of hyperparameter tuning.
-
-switching from `scale_pos_weight` to **SMOTE** oversampling fixes the
-split-starvation — the model now trains for ~24 iterations and produces a wide
-probability range [0.18, 0.82].  However, the resulting discrimination is still
-poor (test AUC 0.275), meaning the model assigns *higher* probabilities to
-non-incident steps than incident steps.
-
-The **Neural Network (MLP)** does not suffer this issue because it expands
-all leaves at each depth level, forcing exploration of the full feature space
-even when individual gains are small.
+The **Neural Network (MLP)** sidesteps this entirely by expanding all nodes at each layer. It’s forced to look at the whole feature space, even when the immediate gain is tiny, resulting in much better generalization for this specific dataset.
 
 ---
 
-## Models
+## Our Models
 
-### Neural Network (MLP) (primary)
+### Neural Network (MLP) (Primary)
 
-- Built in `sklearn.neural_network.MLPClassifier`.
-- Highly constrained to combat extreme dataset overfitting: only **1 hidden layer (16 neurons)**.
-- **Aggressive Regularisation**: `Adam` optimizer with `alpha=0.01` L2 penalty.
-- **Early Stopping**: Halts natively when validation loss stops dropping (`early_stopping=True`).
-- Class imbalance handled via **SMOTE**.
-- Tuned threshold: **θ = ~0.45** (recall-first)
+- Built with standard `sklearn.neural_network.MLPClassifier`.
+- Intentionally kept small to prevent overfitting: just **1 hidden layer with 16 neurons**.
+- **Aggressive Regularization**: Uses the `Adam` optimizer with an `alpha=0.01` L2 penalty.
+- **Early Stopping**: Stops training automatically when the validation loss bottoms out.
+- Handled class imbalance using **SMOTE**.
+- Threshold tuned to **θ = ~0.45** (prioritizing recall).
 
-### Logistic Regression (baseline)
-- Implemented via `sklearn.linear_model.LogisticRegression`.
-- Wrapped in a `StandardScaler`.
-- Utilises **SMOTE** oversampling.
+### Logistic Regression (Baseline)
+- Built with `sklearn.linear_model.LogisticRegression`.
+- Wrapped in a `StandardScaler` to ensure everything is treated fairly.
+- Handled class imbalance using **SMOTE**.
 
-### LightGBM (baseline)
+### LightGBM (Baseline)
 
-- Class imbalance handled via **SMOTE** oversampling (not `scale_pos_weight`,
-  which caused the model to stall after 1 iteration — see *"Why LightGBM
-  underperforms Neural Network (MLP) here"* above)
-- 500 estimators, max depth 6, `num_leaves=31`, early stopping on validation loss
-- Tuned threshold: **θ = 0.35** (recall-first)
+- Handled class imbalance using **SMOTE** oversampling (because `scale_pos_weight` caused it to stall after 1 iteration as discussed above).
+- 500 estimators, max depth 6, `num_leaves=31`, early stopping on validation loss.
+- Tuned threshold: **θ = 0.35** (prioritizing recall).
 
-### Threshold tuning strategy
+### Tuning the Alert Threshold
 
-The original threshold was chosen to **maximise F1**, which can sacrifice recall
-for precision. Since the project requirement is **≥ 80 % incident recall**, the
-threshold is now selected using a **recall-first sweep**: find the highest
-threshold where incident-level recall ≥ 80 %, falling back to the F1-maximising
-threshold only if that target is unachievable.
+If you optimize strictly for the F1 score, you often end up sacrificing recall for precision. But in a real alerting system, missing an incident is way worse than getting a false alarm. So, we use a **recall-first** strategy. We find the highest threshold that still catches ≥ 80% of incident windows, and only fall back to F1 if that goal is completely out of reach.
 
-This is implemented in `find_recall_threshold()` in `model.py`.
+You can check out how we do this in `find_recall_threshold()` over in `model.py`.
 
 ### Optuna hyper-parameter tuning
 

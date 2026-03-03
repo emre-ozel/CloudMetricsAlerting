@@ -7,13 +7,11 @@ concatenate them row-wise (each file becomes a separate segment).
 """
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pandas as pd
-import numpy as np
 
 # ── Configuration ──────────────────────────────────────────────────────────
 NAB_REPO = "https://github.com/numenta/NAB.git"
